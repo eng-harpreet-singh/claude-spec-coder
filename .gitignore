@@ -1,0 +1,11 @@
+/claude-spec-coder
+/output/
+*.exe
+*.test
+*.out
+/vendor/
+.env
+.env.local
+.vscode/
+.idea/
+.DS_Store
