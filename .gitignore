@@ -1,11 +1,22 @@
+# Compiled binary
 /claude-spec-coder
+
+# Generated output from running the tool
 /output/
+
+# Generic Go build artifacts
 *.exe
 *.test
 *.out
+
+# Vendored dependencies
 /vendor/
+
+# Environment files — never commit API keys
 .env
 .env.local
+
+# Editor and OS files
 .vscode/
 .idea/
 .DS_Store

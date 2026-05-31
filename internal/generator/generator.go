@@ -1,12 +1,14 @@
 // Package generator wraps the Claude Messages API to produce Go code from
-// a natural-language specification. It exposes two patterns: GenerateOnce
-// for one-shot calls, and Conversation+Send for multi-turn refinement.
+// a natural-language specification. It exposes two patterns — GenerateOnce
+// for one-shot calls, and Conversation+Send for multi-turn refinement —
+// and offers streaming variants of both.
 package generator
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -31,6 +33,9 @@ Rules:
 - When asked to change existing code, return the full updated file.
 - If no change is needed, respond with a short plain-text explanation
   and no code.`
+
+// TokenHandler receives each text delta as the model streams its reply.
+type TokenHandler func(text string)
 
 // Generator issues requests against the Claude Messages API.
 type Generator struct {
@@ -66,33 +71,48 @@ func (c *Conversation) TurnCount() int {
 	return n
 }
 
-// MessageCount returns the total number of messages in the history,
-// counting user and assistant messages together.
+// MessageCount returns the total number of messages in the history.
 func (c *Conversation) MessageCount() int { return len(c.messages) }
 
-// GenerateOnce sends a single message to Claude and returns the generated
-// code. It does not retain any history. An error is returned if Claude
-// responds without code.
+// GenerateOnce sends a single message and returns the generated code.
+// History is not retained. Returns an error if Claude responds with no code.
 func (g *Generator) GenerateOnce(ctx context.Context, prompt string) (string, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return "", errors.New("prompt is empty")
 	}
 
-	resp, err := g.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:       g.model,
-		MaxTokens:   maxTokens,
-		Temperature: anthropic.Float(0),
-		System:      []anthropic.TextBlockParam{{Text: systemInstruction}},
-		Messages: []anthropic.MessageParam{
-			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
-		},
-	})
+	resp, err := g.client.Messages.New(ctx, g.params([]anthropic.MessageParam{
+		anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
+	}))
 	if err != nil {
 		return "", fmt.Errorf("claude messages: %w", err)
 	}
 
-	code, _, ok := extractCode(resp)
+	code, _, ok := extractFromMessage(resp)
+	if !ok {
+		return "", errors.New("claude returned no code")
+	}
+	return code, nil
+}
+
+// GenerateOnceStream is the streaming variant of GenerateOnce. Each text
+// delta is passed to onToken as it arrives; the full accumulated reply is
+// parsed at the end and the extracted code is returned.
+func (g *Generator) GenerateOnceStream(ctx context.Context, prompt string, onToken TokenHandler) (string, error) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return "", errors.New("prompt is empty")
+	}
+
+	raw, err := g.stream(ctx, []anthropic.MessageParam{
+		anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
+	}, onToken)
+	if err != nil {
+		return "", err
+	}
+
+	code, ok := extractCode(raw)
 	if !ok {
 		return "", errors.New("claude returned no code")
 	}
@@ -102,10 +122,6 @@ func (g *Generator) GenerateOnce(ctx context.Context, prompt string) (string, er
 // Send appends userMessage to conv, calls Claude with the full history,
 // and appends the reply to conv. It returns the extracted code, the raw
 // reply text, and a flag indicating whether any code was found.
-//
-// When hasCode is false, the caller should display raw rather than write
-// to disk. The assistant message is appended to history either way so
-// subsequent turns have full context.
 func (g *Generator) Send(ctx context.Context, conv *Conversation, userMessage string) (code, raw string, hasCode bool, err error) {
 	userMessage = strings.TrimSpace(userMessage)
 	if userMessage == "" {
@@ -116,54 +132,126 @@ func (g *Generator) Send(ctx context.Context, conv *Conversation, userMessage st
 		anthropic.NewUserMessage(anthropic.NewTextBlock(userMessage)),
 	)
 
-	resp, err := g.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:       g.model,
-		MaxTokens:   maxTokens,
-		Temperature: anthropic.Float(0),
-		System:      []anthropic.TextBlockParam{{Text: systemInstruction}},
-		Messages:    conv.messages,
-	})
+	resp, err := g.client.Messages.New(ctx, g.params(conv.messages))
 	if err != nil {
-		// Roll back so a retry does not double-append.
 		conv.messages = conv.messages[:len(conv.messages)-1]
 		return "", "", false, fmt.Errorf("claude messages: %w", err)
 	}
 
-	code, raw, hasCode = extractCode(resp)
+	code, raw, hasCode = extractFromMessage(resp)
 	conv.messages = append(conv.messages,
 		anthropic.NewAssistantMessage(anthropic.NewTextBlock(raw)),
 	)
 	return code, raw, hasCode, nil
 }
 
-// extractCode pulls Go source out of a Claude response. The system prompt
-// asks for raw code, but the model occasionally returns prose with a
-// fenced block ("no changes needed, here's the file"), so both shapes
-// are handled.
-func extractCode(resp *anthropic.Message) (code, raw string, ok bool) {
+// SendStream is the streaming variant of Send. Each text delta is passed
+// to onToken as it arrives; the full accumulated reply is parsed at the
+// end. History is updated identically to Send.
+func (g *Generator) SendStream(ctx context.Context, conv *Conversation, userMessage string, onToken TokenHandler) (code, raw string, hasCode bool, err error) {
+	userMessage = strings.TrimSpace(userMessage)
+	if userMessage == "" {
+		return "", "", false, errors.New("user message is empty")
+	}
+
+	conv.messages = append(conv.messages,
+		anthropic.NewUserMessage(anthropic.NewTextBlock(userMessage)),
+	)
+
+	raw, err = g.stream(ctx, conv.messages, onToken)
+	if err != nil {
+		conv.messages = conv.messages[:len(conv.messages)-1]
+		return "", "", false, err
+	}
+
+	code, hasCode = extractCode(raw)
+	conv.messages = append(conv.messages,
+		anthropic.NewAssistantMessage(anthropic.NewTextBlock(raw)),
+	)
+	return code, raw, hasCode, nil
+}
+
+// params builds the MessageNewParams shared by every API call.
+func (g *Generator) params(messages []anthropic.MessageParam) anthropic.MessageNewParams {
+	return anthropic.MessageNewParams{
+		Model:       g.model,
+		MaxTokens:   maxTokens,
+		Temperature: anthropic.Float(0),
+		System:      []anthropic.TextBlockParam{{Text: systemInstruction}},
+		Messages:    messages,
+	}
+}
+
+// stream issues a streaming request and feeds each text delta to onToken.
+// It returns the full accumulated reply text once the stream completes.
+//
+// The SDK exposes streaming as a sequence of typed events; we react only
+// to ContentBlockDeltaEvent → TextDelta, which is where the assistant's
+// generated text lives. Other event types (message_start, content_block_start,
+// usage updates, message_stop) are intentionally ignored for this use case.
+func (g *Generator) stream(ctx context.Context, messages []anthropic.MessageParam, onToken TokenHandler) (string, error) {
+	stream := g.client.Messages.NewStreaming(ctx, g.params(messages))
+
+	var b strings.Builder
+	for stream.Next() {
+		event := stream.Current()
+
+		// DIAGNOSTIC: print every event type that arrives
+		fmt.Fprintf(os.Stderr, "[event: %T]\n", event.AsAny())
+
+		if delta, ok := event.AsAny().(anthropic.ContentBlockDeltaEvent); ok {
+			if td, ok := delta.Delta.AsAny().(anthropic.TextDelta); ok {
+				b.WriteString(td.Text)
+				if onToken != nil {
+					onToken(td.Text)
+				}
+			}
+		}
+	}
+
+	if err := stream.Err(); err != nil {
+		return "", fmt.Errorf("claude streaming: %w", err)
+	}
+	return b.String(), nil
+}
+
+// extractFromMessage pulls text from a non-streamed Message response and
+// extracts the Go code.
+func extractFromMessage(resp *anthropic.Message) (code, raw string, ok bool) {
 	if resp == nil || len(resp.Content) == 0 {
 		return "", "", false
 	}
-
 	var b strings.Builder
 	for _, block := range resp.Content {
 		b.WriteString(block.Text)
 	}
 	raw = b.String()
+	code, ok = extractCode(raw)
+	return code, raw, ok
+}
 
+// extractCode pulls Go source out of a raw model reply. The system prompt
+// asks for raw code, but the model occasionally returns prose with a
+// fenced block ("no changes needed, here's the file"), so both shapes
+// are handled.
+func extractCode(raw string) (string, bool) {
 	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", false
+	}
+
 	switch {
 	case strings.HasPrefix(trimmed, "package "):
-		return stripTrailingFence(trimmed) + "\n", raw, true
+		return stripTrailingFence(trimmed) + "\n", true
 	case strings.Contains(trimmed, "```"):
 		if fenced, found := extractFencedBlock(trimmed); found {
 			fenced = strings.TrimSpace(fenced)
 			if strings.HasPrefix(fenced, "package ") {
-				return fenced + "\n", raw, true
+				return fenced + "\n", true
 			}
 		}
 	}
-	return "", raw, false
+	return "", false
 }
 
 func extractFencedBlock(s string) (string, bool) {
