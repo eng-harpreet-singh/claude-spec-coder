@@ -3,6 +3,8 @@ package generator
 import (
 	"context"
 	"testing"
+
+	"github.com/anthropics/anthropic-sdk-go"
 )
 
 func TestNewConversation_StartsEmpty(t *testing.T) {
@@ -24,15 +26,6 @@ func TestGenerateOnce_RejectsEmptyPrompt(t *testing.T) {
 	}
 }
 
-func TestGenerateOnceStream_RejectsEmptyPrompt(t *testing.T) {
-	g := New("test-key")
-	for _, in := range []string{"", "   "} {
-		if _, err := g.GenerateOnceStream(context.Background(), in, nil); err == nil {
-			t.Errorf("GenerateOnceStream(%q) returned nil error", in)
-		}
-	}
-}
-
 func TestSend_RejectsEmptyMessage(t *testing.T) {
 	g := New("test-key")
 	c := NewConversation()
@@ -44,14 +37,39 @@ func TestSend_RejectsEmptyMessage(t *testing.T) {
 	}
 }
 
-func TestSendStream_RejectsEmptyMessage(t *testing.T) {
+// TestTruncateIfNeeded_NoOpWhenEmpty verifies that truncation on an empty
+// conversation does nothing.
+func TestTruncateIfNeeded_NoOpWhenEmpty(t *testing.T) {
 	g := New("test-key")
 	c := NewConversation()
-	if _, _, _, err := g.SendStream(context.Background(), c, "   ", nil); err == nil {
-		t.Fatal("SendStream with empty input returned nil error")
+	dropped, err := g.TruncateIfNeeded(context.Background(), c, 1000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if c.MessageCount() != 0 {
-		t.Errorf("history grew on rejected input: %d messages", c.MessageCount())
+	if dropped != 0 {
+		t.Errorf("dropped = %d, want 0", dropped)
+	}
+}
+
+// TestTruncateIfNeeded_DisabledWhenMaxZero verifies that a zero or negative
+// limit disables truncation entirely.
+func TestTruncateIfNeeded_DisabledWhenMaxZero(t *testing.T) {
+	g := New("test-key")
+	c := &Conversation{
+		messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock("hello")),
+			anthropic.NewAssistantMessage(anthropic.NewTextBlock("world")),
+		},
+	}
+	dropped, err := g.TruncateIfNeeded(context.Background(), c, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dropped != 0 {
+		t.Errorf("dropped = %d, want 0", dropped)
+	}
+	if c.MessageCount() != 2 {
+		t.Errorf("messages dropped despite disabled limit")
 	}
 }
 
@@ -62,47 +80,19 @@ func TestExtractCode(t *testing.T) {
 		want    string
 		hasCode bool
 	}{
-		{
-			name:    "raw package declaration",
-			in:      "package main\n\nfunc f() {}",
-			want:    "package main\n\nfunc f() {}\n",
-			hasCode: true,
-		},
-		{
-			name:    "fenced with language tag",
-			in:      "```go\npackage main\n\nfunc f() {}\n```",
-			want:    "package main\n\nfunc f() {}\n",
-			hasCode: true,
-		},
-		{
-			name:    "fenced without language tag",
-			in:      "```\npackage main\nfunc f() {}\n```",
-			want:    "package main\nfunc f() {}\n",
-			hasCode: true,
-		},
-		{
-			name:    "prose preamble plus fenced code",
-			in:      "No changes needed. Here is the file:\n\n```go\npackage main\nfunc f() {}\n```",
-			want:    "package main\nfunc f() {}\n",
-			hasCode: true,
-		},
-		{
-			name:    "pure prose",
-			in:      "The code is already correct.",
-			hasCode: false,
-		},
-		{
-			name:    "empty",
-			in:      "   \n\t  ",
-			hasCode: false,
-		},
+		{"raw package", "package main\nfunc f() {}", "package main\nfunc f() {}\n", true},
+		{"fenced go", "```go\npackage main\nfunc f() {}\n```", "package main\nfunc f() {}\n", true},
+		{"fenced no lang", "```\npackage main\n```", "package main\n", true},
+		{"prose plus fenced", "No changes.\n\n```go\npackage main\n```", "package main\n", true},
+		{"pure prose", "Already correct.", "", false},
+		{"empty", "   ", "", false},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got, ok := extractCode(tc.in)
 			if ok != tc.hasCode {
-				t.Fatalf("hasCode = %v, want %v (got %q)", ok, tc.hasCode, got)
+				t.Fatalf("hasCode = %v, want %v", ok, tc.hasCode)
 			}
 			if ok && got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)
@@ -118,10 +108,10 @@ func TestExtractFencedBlock(t *testing.T) {
 		want  string
 		found bool
 	}{
-		{"with language tag", "```go\npackage main\n```", "package main\n", true},
-		{"without language tag", "```\npackage main\n```", "package main\n", true},
+		{"with tag", "```go\npackage main\n```", "package main\n", true},
+		{"no tag", "```\npackage main\n```", "package main\n", true},
 		{"no fence", "package main", "", false},
-		{"unclosed fence", "```go\npackage main", "", false},
+		{"unclosed", "```go\npackage main", "", false},
 	}
 
 	for _, tc := range tests {

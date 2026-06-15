@@ -1,14 +1,13 @@
 // Package generator wraps the Claude Messages API to produce Go code from
-// a natural-language specification. It exposes two patterns — GenerateOnce
-// for one-shot calls, and Conversation+Send for multi-turn refinement —
-// and offers streaming variants of both.
+// a natural-language specification. It exposes one-shot and multi-turn
+// patterns (with optional streaming) and provides token-aware history
+// truncation for long conversations.
 package generator
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -20,8 +19,7 @@ const defaultModel = "claude-sonnet-4-6"
 const maxTokens = 2048
 
 // systemInstruction constrains the model to return raw Go code so the
-// output can be written directly to a .go file. The "no changes" clause
-// is what lets callers detect a refinement that didn't require an edit.
+// output can be written directly to a .go file.
 const systemInstruction = `You are a senior Go engineer.
 Produce production-quality Go code that satisfies the user's request.
 
@@ -74,8 +72,56 @@ func (c *Conversation) TurnCount() int {
 // MessageCount returns the total number of messages in the history.
 func (c *Conversation) MessageCount() int { return len(c.messages) }
 
+// TokenCount asks the API how many input tokens the current conversation
+// would consume. Returns the exact billing-equivalent number.
+func (g *Generator) TokenCount(ctx context.Context, conv *Conversation) (int, error) {
+	if len(conv.messages) == 0 {
+		return 0, nil
+	}
+	res, err := g.client.Messages.CountTokens(ctx, anthropic.MessageCountTokensParams{
+		Model:    g.model,
+		Messages: conv.messages,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("count tokens: %w", err)
+	}
+	return int(res.InputTokens), nil
+}
+
+// TruncateIfNeeded drops the oldest user+assistant pairs until the
+// conversation's input token count is at or below maxInputTokens. Returns
+// the number of messages that were dropped (0 if no truncation was needed).
+//
+// We always drop in pairs to keep the user/assistant alternation valid.
+// The API rejects histories that start with an assistant message or have
+// two consecutive messages of the same role.
+func (g *Generator) TruncateIfNeeded(ctx context.Context, conv *Conversation, maxInputTokens int) (int, error) {
+	if maxInputTokens <= 0 || len(conv.messages) == 0 {
+		return 0, nil
+	}
+
+	dropped := 0
+	for {
+		tokens, err := g.TokenCount(ctx, conv)
+		if err != nil {
+			return dropped, err
+		}
+		if tokens <= maxInputTokens {
+			return dropped, nil
+		}
+
+		// Drop the oldest two messages (one user, one assistant). If only
+		// one message remains we cannot truncate further without leaving
+		// an invalid history; bail out.
+		if len(conv.messages) < 2 {
+			return dropped, nil
+		}
+		conv.messages = conv.messages[2:]
+		dropped += 2
+	}
+}
+
 // GenerateOnce sends a single message and returns the generated code.
-// History is not retained. Returns an error if Claude responds with no code.
 func (g *Generator) GenerateOnce(ctx context.Context, prompt string) (string, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
@@ -96,9 +142,7 @@ func (g *Generator) GenerateOnce(ctx context.Context, prompt string) (string, er
 	return code, nil
 }
 
-// GenerateOnceStream is the streaming variant of GenerateOnce. Each text
-// delta is passed to onToken as it arrives; the full accumulated reply is
-// parsed at the end and the extracted code is returned.
+// GenerateOnceStream is the streaming variant of GenerateOnce.
 func (g *Generator) GenerateOnceStream(ctx context.Context, prompt string, onToken TokenHandler) (string, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
@@ -120,8 +164,7 @@ func (g *Generator) GenerateOnceStream(ctx context.Context, prompt string, onTok
 }
 
 // Send appends userMessage to conv, calls Claude with the full history,
-// and appends the reply to conv. It returns the extracted code, the raw
-// reply text, and a flag indicating whether any code was found.
+// and appends the reply to conv.
 func (g *Generator) Send(ctx context.Context, conv *Conversation, userMessage string) (code, raw string, hasCode bool, err error) {
 	userMessage = strings.TrimSpace(userMessage)
 	if userMessage == "" {
@@ -145,9 +188,7 @@ func (g *Generator) Send(ctx context.Context, conv *Conversation, userMessage st
 	return code, raw, hasCode, nil
 }
 
-// SendStream is the streaming variant of Send. Each text delta is passed
-// to onToken as it arrives; the full accumulated reply is parsed at the
-// end. History is updated identically to Send.
+// SendStream is the streaming variant of Send.
 func (g *Generator) SendStream(ctx context.Context, conv *Conversation, userMessage string, onToken TokenHandler) (code, raw string, hasCode bool, err error) {
 	userMessage = strings.TrimSpace(userMessage)
 	if userMessage == "" {
@@ -171,7 +212,6 @@ func (g *Generator) SendStream(ctx context.Context, conv *Conversation, userMess
 	return code, raw, hasCode, nil
 }
 
-// params builds the MessageNewParams shared by every API call.
 func (g *Generator) params(messages []anthropic.MessageParam) anthropic.MessageNewParams {
 	return anthropic.MessageNewParams{
 		Model:       g.model,
@@ -182,23 +222,12 @@ func (g *Generator) params(messages []anthropic.MessageParam) anthropic.MessageN
 	}
 }
 
-// stream issues a streaming request and feeds each text delta to onToken.
-// It returns the full accumulated reply text once the stream completes.
-//
-// The SDK exposes streaming as a sequence of typed events; we react only
-// to ContentBlockDeltaEvent → TextDelta, which is where the assistant's
-// generated text lives. Other event types (message_start, content_block_start,
-// usage updates, message_stop) are intentionally ignored for this use case.
 func (g *Generator) stream(ctx context.Context, messages []anthropic.MessageParam, onToken TokenHandler) (string, error) {
 	stream := g.client.Messages.NewStreaming(ctx, g.params(messages))
 
 	var b strings.Builder
 	for stream.Next() {
 		event := stream.Current()
-
-		// DIAGNOSTIC: print every event type that arrives
-		fmt.Fprintf(os.Stderr, "[event: %T]\n", event.AsAny())
-
 		if delta, ok := event.AsAny().(anthropic.ContentBlockDeltaEvent); ok {
 			if td, ok := delta.Delta.AsAny().(anthropic.TextDelta); ok {
 				b.WriteString(td.Text)
@@ -215,8 +244,6 @@ func (g *Generator) stream(ctx context.Context, messages []anthropic.MessagePara
 	return b.String(), nil
 }
 
-// extractFromMessage pulls text from a non-streamed Message response and
-// extracts the Go code.
 func extractFromMessage(resp *anthropic.Message) (code, raw string, ok bool) {
 	if resp == nil || len(resp.Content) == 0 {
 		return "", "", false
@@ -230,10 +257,6 @@ func extractFromMessage(resp *anthropic.Message) (code, raw string, ok bool) {
 	return code, raw, ok
 }
 
-// extractCode pulls Go source out of a raw model reply. The system prompt
-// asks for raw code, but the model occasionally returns prose with a
-// fenced block ("no changes needed, here's the file"), so both shapes
-// are handled.
 func extractCode(raw string) (string, bool) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {

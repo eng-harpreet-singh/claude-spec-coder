@@ -1,7 +1,7 @@
 // Command claude-spec-coder generates Go code from a Markdown specification
-// using the Claude API. It runs in one of two modes — single-shot generation
-// from a spec, or an interactive refinement loop that maintains conversation
-// history across turns — and supports response streaming in both.
+// using the Claude API. It runs in 'once' or 'refine' mode, supports
+// response streaming, and (since V007) auto-truncates conversation history
+// when it would exceed the configured token budget.
 package main
 
 import (
@@ -22,6 +22,7 @@ func main() {
 	specPath := flag.String("spec", "spec.md", "path to the specification file")
 	outPath := flag.String("out", "output/generated.go", "path to write the generated code")
 	stream := flag.Bool("stream", false, "print tokens as they arrive instead of waiting for the full response")
+	maxTokens := flag.Int("max-history-tokens", 4000, "auto-truncate history when it would exceed this many input tokens (refine mode)")
 	flag.Parse()
 
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
@@ -40,7 +41,7 @@ func main() {
 	case "once":
 		runOnce(gen, string(spec), *outPath, *stream)
 	case "refine":
-		runRefine(gen, string(spec), *outPath, *stream)
+		runRefine(gen, string(spec), *outPath, *stream, *maxTokens)
 	default:
 		log.Fatalf("unknown mode %q (use 'once' or 'refine')", *mode)
 	}
@@ -67,7 +68,7 @@ func runOnce(gen *generator.Generator, spec, outPath string, stream bool) {
 	log.Printf("wrote %s", outPath)
 }
 
-func runRefine(gen *generator.Generator, spec, outPath string, stream bool) {
+func runRefine(gen *generator.Generator, spec, outPath string, stream bool, maxHistoryTokens int) {
 	ctx := context.Background()
 	conv := generator.NewConversation()
 
@@ -79,7 +80,7 @@ func runRefine(gen *generator.Generator, spec, outPath string, stream bool) {
 		log.Fatal("initial generation returned no code")
 	}
 	writeFile(outPath, code)
-	log.Printf("wrote %s (turn %d)", outPath, conv.TurnCount())
+	logTurnState(ctx, gen, conv, outPath)
 	fmt.Println()
 
 	reader := bufio.NewReader(os.Stdin)
@@ -98,6 +99,16 @@ func runRefine(gen *generator.Generator, spec, outPath string, stream bool) {
 			return
 		}
 
+		// Before sending, check whether history is over budget. If so,
+		// drop oldest turns until we fit.
+		if maxHistoryTokens > 0 {
+			if dropped, err := gen.TruncateIfNeeded(ctx, conv, maxHistoryTokens); err != nil {
+				log.Printf("truncate check failed: %v", err)
+			} else if dropped > 0 {
+				log.Printf("history over budget — dropped %d oldest messages", dropped)
+			}
+		}
+
 		code, raw, hasCode, err := sendOnce(ctx, gen, conv, input, stream)
 		if err != nil {
 			log.Printf("send failed: %v", err)
@@ -110,19 +121,31 @@ func runRefine(gen *generator.Generator, spec, outPath string, stream bool) {
 				fmt.Println(raw)
 			}
 			fmt.Println()
-			log.Printf("no code returned, %s unchanged (turn %d)", outPath, conv.TurnCount())
+			log.Printf("no code returned, %s unchanged", outPath)
+			logTurnState(ctx, gen, conv, outPath)
 			continue
 		}
 
 		writeFile(outPath, code)
-		log.Printf("wrote %s (turn %d, %d messages in history)", outPath, conv.TurnCount(), conv.MessageCount())
+		log.Printf("wrote %s", outPath)
+		logTurnState(ctx, gen, conv, outPath)
 		fmt.Println()
 	}
 }
 
-// sendOnce dispatches to the streaming or buffered Send depending on the flag.
-// Streaming prints tokens to stdout as they arrive; buffered returns the full
-// reply at the end.
+// logTurnState prints the turn count, message count, and current input
+// token count so the viewer can watch history grow over the session.
+func logTurnState(ctx context.Context, gen *generator.Generator, conv *generator.Conversation, _ string) {
+	tokens, err := gen.TokenCount(ctx, conv)
+	if err != nil {
+		log.Printf("turn %d  ·  %d messages in history  ·  token count unavailable: %v",
+			conv.TurnCount(), conv.MessageCount(), err)
+		return
+	}
+	log.Printf("turn %d  ·  %d messages  ·  %d input tokens",
+		conv.TurnCount(), conv.MessageCount(), tokens)
+}
+
 func sendOnce(ctx context.Context, gen *generator.Generator, conv *generator.Conversation, msg string, stream bool) (code, raw string, hasCode bool, err error) {
 	if stream {
 		code, raw, hasCode, err = gen.SendStream(ctx, conv, msg, printToken)
@@ -132,8 +155,6 @@ func sendOnce(ctx context.Context, gen *generator.Generator, conv *generator.Con
 	return gen.Send(ctx, conv, msg)
 }
 
-// printToken writes a streamed token to stdout and flushes so it appears
-// immediately. Without the flush the terminal would buffer until a newline.
 func printToken(t string) {
 	os.Stdout.WriteString(t)
 }

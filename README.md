@@ -1,17 +1,19 @@
 # claude-spec-coder
 
 A command-line tool that generates Go code from a Markdown specification
-by way of the Claude API. It runs in one of two modes — single-shot
-generation, or interactive refinement — and supports response streaming
-in both.
+by way of the Claude API.
 
 | Mode | Description |
 | --- | --- |
 | `once` | One-shot generation. Read the spec, call Claude, write the output, exit. |
 | `refine` | Generate from the spec, then accept refinement instructions on stdin. Each turn replays the full conversation history. |
 
-The `-stream` flag prints tokens as they arrive, instead of waiting for
+The `-stream` flag prints tokens as they arrive instead of waiting for
 the complete response.
+
+The `-max-history-tokens` flag auto-truncates conversation history when
+it would exceed the configured token budget, so long refine sessions
+don't blow through the model's context window.
 
 ## Requirements
 
@@ -29,43 +31,37 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 ## Usage
 
-Single-shot generation from the included example spec:
-
 ```sh
+# Single-shot generation
 go run . -mode=once
-```
 
-Single-shot generation, streaming the response to the terminal:
-
-```sh
+# Single-shot, streaming
 go run . -mode=once -stream
-```
 
-Interactive refinement:
-
-```sh
+# Interactive refinement
 go run . -mode=refine
-```
 
-Interactive refinement with streaming (recommended — gives faster
-feedback as the model writes):
-
-```sh
+# Interactive refinement with streaming
 go run . -mode=refine -stream
+
+# Refinement with a tight token budget (auto-truncates older turns)
+go run . -mode=refine -stream -max-history-tokens=2000
 ```
 
-Flags:
+### Flags
 
 ```
--mode    string   "once" or "refine"                 (default "once")
--spec    string   path to the specification file     (default "spec.md")
--out     string   path to write generated code       (default "output/generated.go")
--stream  bool     print tokens as they arrive        (default false)
+-mode                string   "once" or "refine"                    (default "once")
+-spec                string   path to the specification file        (default "spec.md")
+-out                 string   path to write generated code          (default "output/generated.go")
+-stream              bool     print tokens as they arrive           (default false)
+-max-history-tokens  int      truncate history at this many tokens  (default 4000)
 ```
 
-In refine mode, type instructions at the `refine ▸` prompt. Type `exit`
-to quit. When a refinement requires no change, Claude responds with a
-short explanation and the output file is left as-is.
+In `refine` mode the tool prints turn count, message count, and current
+input token count after every turn so you can watch the conversation
+grow. When the count exceeds `-max-history-tokens`, the oldest user +
+assistant pair is dropped before the next call.
 
 ## Layout
 
@@ -74,15 +70,29 @@ short explanation and the output file is left as-is.
 ├── main.go
 ├── internal/
 │   └── generator/
-│       ├── generator.go
-│       └── generator_test.go
+│       ├── generator.go      API client, conversation, token counting, truncation
+│       └── generator_test.go unit tests (no API key required)
 ├── spec.md
 ├── go.mod
 └── README.md
 ```
 
-`main.go` is wiring only: flags, I/O, and the refine loop. All API logic
-lives in `internal/generator`, which is independently testable.
+## How truncation works
+
+Before each refine turn:
+
+1. Count input tokens for the current history (`Messages.CountTokens`).
+2. If the count is over the limit, drop the oldest user+assistant pair.
+3. Repeat until the history fits.
+
+Messages are dropped in pairs to preserve the user/assistant alternation
+the API requires. The system prompt is never truncated. The most recent
+turns — which carry the most relevant context for the next response —
+are always kept.
+
+This is the simplest production strategy. More sophisticated approaches
+(summarising old turns into a single message, semantic relevance
+ranking) are out of scope for this tool.
 
 ## Tests
 
@@ -90,21 +100,17 @@ lives in `internal/generator`, which is independently testable.
 go test ./...
 ```
 
-Tests cover input validation, the conversation lifecycle, and the
-response parser. They do not require an API key or a network.
+Tests cover input validation, conversation lifecycle, the response
+parser, and the truncation no-op paths. They do not require an API key
+or a network.
 
 ## Notes
 
-- Temperature is fixed at 0. The same prompt produces the same output,
-  which makes review tractable.
-- The API key is read from `ANTHROPIC_API_KEY`. It is never embedded
-  in source.
-- Streaming responses reduces perceived latency, especially for longer
-  outputs. The full response is still parsed at the end before the file
-  is written.
-- The conversation history grows on every refine turn. Long sessions
-  will eventually hit the model's context limit; truncation or
-  summarisation belongs in a future change.
+- Temperature is fixed at 0. The same prompt produces the same output.
+- The API key is read from `ANTHROPIC_API_KEY`. It is never embedded.
+- Token counting issues one API call per truncation check. For very
+  long sessions this is cheap but not free. For tight cost control,
+  cache the count locally between turns or estimate before calling.
 
 ## License
 
